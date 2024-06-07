@@ -21,6 +21,8 @@
 #include "libavutil/avstring.h"
 #include "libavutil/pixdesc.h"
 #include "libavfilter/buffersink.h"
+#include "libavutil/opt.h"
+#include "libavutil/channel_layout.h"
 
 #include "ffmpeg.h"
 
@@ -68,9 +70,6 @@ static HWDevice *hw_device_add(void)
 
 static char *hw_device_default_name(enum AVHWDeviceType type)
 {
-    // Make an automatic name of the form "type%d".  We arbitrarily
-    // limit at 1000 anonymous devices of the same type - there is
-    // probably something else very wrong if you get to this limit.
     const char *type_name = av_hwdevice_get_type_name(type);
     char *name;
     size_t index_pos;
@@ -93,15 +92,6 @@ static char *hw_device_default_name(enum AVHWDeviceType type)
 
 int hw_device_init_from_string(const char *arg, HWDevice **dev_out)
 {
-    // "type=name"
-    // "type=name,key=value,key2=value2"
-    // "type=name:device,key=value,key2=value2"
-    // "type:device,key=value,key2=value2"
-    // -> av_hwdevice_ctx_create()
-    // "type=name@name"
-    // "type@name"
-    // -> av_hwdevice_ctx_create_derived()
-
     AVDictionary *options = NULL;
     const char *type_name = NULL, *name = NULL, *device = NULL;
     enum AVHWDeviceType type;
@@ -148,14 +138,12 @@ int hw_device_init_from_string(const char *arg, HWDevice **dev_out)
     }
 
     if (!*p) {
-        // New device with no parameters.
         err = av_hwdevice_ctx_create(&device_ref, type,
                                      NULL, NULL, 0);
         if (err < 0)
             goto fail;
 
     } else if (*p == ':') {
-        // New device with some parameters.
         ++p;
         q = strchr(p, ',');
         if (q) {
@@ -180,8 +168,6 @@ int hw_device_init_from_string(const char *arg, HWDevice **dev_out)
             goto fail;
 
     } else if (*p == '@') {
-        // Derive from existing device.
-
         src = hw_device_get_by_name(p + 1);
         if (!src) {
             errmsg = "invalid source device name";
@@ -319,265 +305,173 @@ int hw_device_setup_for_decode(InputStream *ist)
     const AVCodecHWConfig *config;
     enum AVHWDeviceType type;
     HWDevice *dev = NULL;
-    int err, auto_device = 0;
+    int i, err;
 
-    if (ist->hwaccel_device) {
-        dev = hw_device_get_by_name(ist->hwaccel_device);
-        if (!dev) {
-            if (ist->hwaccel_id == HWACCEL_AUTO) {
-                auto_device = 1;
-            } else if (ist->hwaccel_id == HWACCEL_GENERIC) {
-                type = ist->hwaccel_device_type;
-                err = hw_device_init_from_type(type, ist->hwaccel_device,
-                                               &dev);
-            } else {
-                // This will be dealt with by API-specific initialisation
-                // (using hwaccel_device), so nothing further needed here.
-                return 0;
-            }
-        } else {
-            if (ist->hwaccel_id == HWACCEL_AUTO) {
-                ist->hwaccel_device_type = dev->type;
-            } else if (ist->hwaccel_device_type != dev->type) {
-                av_log(ist->dec_ctx, AV_LOG_ERROR, "Invalid hwaccel device "
-                       "specified for decoder: device %s of type %s is not "
-                       "usable with hwaccel %s.\n", dev->name,
-                       av_hwdevice_get_type_name(dev->type),
-                       av_hwdevice_get_type_name(ist->hwaccel_device_type));
-                return AVERROR(EINVAL);
-            }
-        }
-    } else {
-        if (ist->hwaccel_id == HWACCEL_AUTO) {
-            auto_device = 1;
-        } else if (ist->hwaccel_id == HWACCEL_GENERIC) {
-            type = ist->hwaccel_device_type;
-            dev = hw_device_get_by_type(type);
-
-            // When "-qsv_device device" is used, an internal QSV device named
-            // as "__qsv_device" is created. Another QSV device is created too
-            // if "-init_hw_device qsv=name:device" is used. There are 2 QSV devices
-            // if both "-qsv_device device" and "-init_hw_device qsv=name:device"
-            // are used, hw_device_get_by_type(AV_HWDEVICE_TYPE_QSV) returns NULL.
-            // To keep back-compatibility with the removed ad-hoc libmfx setup code,
-            // call hw_device_get_by_name("__qsv_device") to select the internal QSV
-            // device.
-            if (!dev && type == AV_HWDEVICE_TYPE_QSV)
-                dev = hw_device_get_by_name("__qsv_device");
-
-            if (!dev)
-                err = hw_device_init_from_type(type, NULL, &dev);
-        } else {
-            dev = hw_device_match_by_codec(ist->dec);
-            if (!dev) {
-                // No device for this codec, but not using generic hwaccel
-                // and therefore may well not need one - ignore.
-                return 0;
-            }
-        }
-    }
-
-    if (auto_device) {
-        int i;
-        if (!avcodec_get_hw_config(ist->dec, 0)) {
-            // Decoder does not support any hardware devices.
-            return 0;
-        }
-        for (i = 0; !dev; i++) {
-            config = avcodec_get_hw_config(ist->dec, i);
-            if (!config)
-                break;
-            type = config->device_type;
-            dev = hw_device_get_by_type(type);
-            if (dev) {
-                av_log(ist->dec_ctx, AV_LOG_INFO, "Using auto "
-                       "hwaccel type %s with existing device %s.\n",
-                       av_hwdevice_get_type_name(type), dev->name);
-            }
-        }
-        for (i = 0; !dev; i++) {
-            config = avcodec_get_hw_config(ist->dec, i);
-            if (!config)
-                break;
-            type = config->device_type;
-            // Try to make a new device of this type.
-            err = hw_device_init_from_type(type, ist->hwaccel_device,
-                                           &dev);
-            if (err < 0) {
-                // Can't make a device of this type.
-                continue;
-            }
-            if (ist->hwaccel_device) {
-                av_log(ist->dec_ctx, AV_LOG_INFO, "Using auto "
-                       "hwaccel type %s with new device created "
-                       "from %s.\n", av_hwdevice_get_type_name(type),
-                       ist->hwaccel_device);
-            } else {
-                av_log(ist->dec_ctx, AV_LOG_INFO, "Using auto "
-                       "hwaccel type %s with new default device.\n",
-                       av_hwdevice_get_type_name(type));
-            }
-        }
-        if (dev) {
-            ist->hwaccel_device_type = type;
-        } else {
-            av_log(ist->dec_ctx, AV_LOG_INFO, "Auto hwaccel "
-                   "disabled: no device found.\n");
-            ist->hwaccel_id = HWACCEL_NONE;
-            return 0;
-        }
-    }
-
-    if (!dev) {
-        av_log(ist->dec_ctx, AV_LOG_ERROR, "No device available "
-               "for decoder: device type %s needed for codec %s.\n",
-               av_hwdevice_get_type_name(type), ist->dec->name);
-        return err;
-    }
-
-    ist->dec_ctx->hw_device_ctx = av_buffer_ref(dev->device_ref);
-    if (!ist->dec_ctx->hw_device_ctx)
-        return AVERROR(ENOMEM);
-
-    return 0;
-}
-
-int hw_device_setup_for_encode(OutputStream *ost)
-{
-    const AVCodecHWConfig *config;
-    HWDevice *dev = NULL;
-    AVBufferRef *frames_ref = NULL;
-    int i;
-
-    if (ost->filter) {
-        frames_ref = av_buffersink_get_hw_frames_ctx(ost->filter->filter);
-        if (frames_ref &&
-            ((AVHWFramesContext*)frames_ref->data)->format ==
-            ost->enc_ctx->pix_fmt) {
-            // Matching format, will try to use hw_frames_ctx.
-        } else {
-            frames_ref = NULL;
-        }
-    }
+    if (ist->hwaccel_id == HWACCEL_NONE)
+        return 0;
 
     for (i = 0;; i++) {
-        config = avcodec_get_hw_config(ost->enc, i);
-        if (!config)
-            break;
-
-        if (frames_ref &&
-            config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX &&
-            (config->pix_fmt == AV_PIX_FMT_NONE ||
-             config->pix_fmt == ost->enc_ctx->pix_fmt)) {
-            av_log(ost->enc_ctx, AV_LOG_VERBOSE, "Using input "
-                   "frames context (format %s) with %s encoder.\n",
-                   av_get_pix_fmt_name(ost->enc_ctx->pix_fmt),
-                   ost->enc->name);
-            ost->enc_ctx->hw_frames_ctx = av_buffer_ref(frames_ref);
-            if (!ost->enc_ctx->hw_frames_ctx)
-                return AVERROR(ENOMEM);
-            return 0;
+        config = avcodec_get_hw_config(ist->dec_ctx->codec, i);
+        if (!config) {
+            av_log(NULL, AV_LOG_ERROR, "Decoder does not support any device type\n");
+            return AVERROR(ENOSYS);
         }
-
-        if (!dev &&
-            config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)
+        if (!(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+            continue;
+        if (config->device_type == ist->hwaccel_device_type) {
             dev = hw_device_get_by_type(config->device_type);
+            if (dev)
+                break;
+        }
+    }
+    if (!dev) {
+        av_log(NULL, AV_LOG_ERROR, "No suitable hwaccel device found\n");
+        return AVERROR(EINVAL);
     }
 
-    if (dev) {
-        av_log(ost->enc_ctx, AV_LOG_VERBOSE, "Using device %s "
-               "(type %s) with %s encoder.\n", dev->name,
-               av_hwdevice_get_type_name(dev->type), ost->enc->name);
-        ost->enc_ctx->hw_device_ctx = av_buffer_ref(dev->device_ref);
-        if (!ost->enc_ctx->hw_device_ctx)
-            return AVERROR(ENOMEM);
-    } else {
-        // No device required, or no device available.
-    }
-    return 0;
-}
+    err = avcodec_set_hw_device_ctx(ist->dec_ctx, dev->device_ref);
+    if (err < 0)
+        return err;
 
-static int hwaccel_retrieve_data(AVCodecContext *avctx, AVFrame *input)
-{
-    InputStream *ist = avctx->opaque;
-    AVFrame *output = NULL;
-    enum AVPixelFormat output_format = ist->hwaccel_output_format;
-    int err;
-
-    if (input->format == output_format) {
-        // Nothing to do.
-        return 0;
-    }
-
-    output = av_frame_alloc();
-    if (!output)
+    ist->hwaccel_device_ref = av_buffer_ref(dev->device_ref);
+    if (!ist->hwaccel_device_ref)
         return AVERROR(ENOMEM);
 
-    output->format = output_format;
-
-    err = av_hwframe_transfer_data(output, input, 0);
-    if (err < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to transfer data to "
-               "output frame: %d.\n", err);
-        goto fail;
-    }
-
-    err = av_frame_copy_props(output, input);
-    if (err < 0) {
-        av_frame_unref(output);
-        goto fail;
-    }
-
-    av_frame_unref(input);
-    av_frame_move_ref(input, output);
-    av_frame_free(&output);
-
     return 0;
-
-fail:
-    av_frame_free(&output);
-    return err;
 }
 
-int hwaccel_decode_init(AVCodecContext *avctx)
+static void set_hwframe_ctx(OutputStream *ost, const AVCodec *codec,
+                            const AVCodecContext *enc_ctx,
+                            HWDevice *dev)
 {
-    InputStream *ist = avctx->opaque;
+    const AVCodecHWConfig *config;
+    int i, err;
+    for (i = 0;; i++) {
+        config = avcodec_get_hw_config(codec, i);
+        if (!config)
+            return;
+        if (!(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX))
+            continue;
+        if (config->device_type != dev->type)
+            continue;
+        err = avcodec_get_hw_frames_parameters(enc_ctx, dev->device_ref,
+                                               config->pix_fmt,
+                                               &ost->hw_frames_ctx);
+        if (err < 0)
+            return;
+        return;
+    }
+}
 
-    ist->hwaccel_retrieve_data = &hwaccel_retrieve_data;
+static int hw_device_setup_for_encode(OutputStream *ost)
+{
+    HWDevice *dev;
+    int err;
 
+    dev = hw_device_match_by_codec(ost->enc_ctx->codec);
+    if (!dev)
+        return 0;
+
+    set_hwframe_ctx(ost, ost->enc_ctx->codec, ost->enc_ctx, dev);
+    if (!ost->hw_frames_ctx)
+        return 0;
+
+    err = avcodec_set_hw_frames_ctx(ost->enc_ctx, ost->hw_frames_ctx);
+    if (err < 0) {
+        av_buffer_unref(&ost->hw_frames_ctx);
+        return err;
+    }
     return 0;
 }
 
 int hw_device_setup_for_filter(FilterGraph *fg)
 {
+    AVFilterContext *sink = fg->graph->sink;
+    const AVCodec *codec;
     HWDevice *dev;
-    int i;
-
-    // Pick the last hardware device if the user doesn't pick the device for
-    // filters explicitly with the filter_hw_device option.
-    if (filter_hw_device)
-        dev = filter_hw_device;
-    else if (nb_hw_devices > 0) {
-        dev = hw_devices[nb_hw_devices - 1];
-
-        if (nb_hw_devices > 1)
-            av_log(NULL, AV_LOG_WARNING, "There are %d hardware devices. device "
-                   "%s of type %s is picked for filters by default. Set hardware "
-                   "device explicitly with the filter_hw_device option if device "
-                   "%s is not usable for filters.\n",
-                   nb_hw_devices, dev->name,
-                   av_hwdevice_get_type_name(dev->type), dev->name);
-    } else
-        dev = NULL;
-
-    if (dev) {
-        for (i = 0; i < fg->graph->nb_filters; i++) {
-            fg->graph->filters[i]->hw_device_ctx =
-                av_buffer_ref(dev->device_ref);
-            if (!fg->graph->filters[i]->hw_device_ctx)
-                return AVERROR(ENOMEM);
+    int i, err;
+    if (sink->nb_inputs == 0)
+        return 0;
+    codec = avcodec_find_decoder(sink->inputs[0]->type);
+    if (!codec)
+        return 0;
+    dev = hw_device_match_by_codec(codec);
+    if (!dev)
+        return 0;
+    for (i = 0; i < fg->graph->nb_filters; i++) {
+        AVFilterContext *filter = fg->graph->filters[i];
+        if (!strcmp(filter->filter->name, "hwupload")) {
+            err = av_opt_set(filter, "device", dev->name, 0);
+            if (err < 0)
+                return err;
         }
     }
+    return 0;
+}
+
+/* New functionality for audio remixing */
+static int remix_audio(AVFrame *frame, const int *remix_map, int remix_size)
+{
+    AVFrame *remix_frame = av_frame_alloc();
+    if (!remix_frame) {
+        av_log(NULL, AV_LOG_ERROR, "Could not allocate remix frame.\n");
+        return AVERROR(ENOMEM);
+    }
+
+    remix_frame->channel_layout = frame->channel_layout;
+    remix_frame->sample_rate = frame->sample_rate;
+    remix_frame->format = frame->format;
+    remix_frame->nb_samples = frame->nb_samples;
+
+    if (av_frame_get_buffer(remix_frame, 0) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Could not allocate remix frame buffer.\n");
+        av_frame_free(&remix_frame);
+        return AVERROR(ENOMEM);
+    }
+
+    for (int i = 0; i < remix_size; ++i) {
+        memcpy(remix_frame->data[i], frame->data[remix_map[i]], remix_frame->linesize[0]);
+    }
+
+    av_frame_copy_props(remix_frame, frame);
+    av_frame_unref(frame);
+    av_frame_move_ref(frame, remix_frame);
 
     return 0;
 }
+
+int apply_audio_remix(InputStream *ist, const int *remix_map, int remix_size)
+{
+    int ret;
+    AVFrame *frame = NULL;
+
+    while ((ret = av_read_frame(ist->avf_ctx, ist->pkt)) >= 0) {
+        if (ist->pkt->stream_index == ist->st->index) {
+            ret = avcodec_send_packet(ist->dec_ctx, ist->pkt);
+            if (ret < 0) {
+                av_log(NULL, AV_LOG_ERROR, "Error sending packet for decoding.\n");
+                break;
+            }
+
+            while ((ret = avcodec_receive_frame(ist->dec_ctx, frame)) >= 0) {
+                ret = remix_audio(frame, remix_map, remix_size);
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "Error remixing audio.\n");
+                    break;
+                }
+
+                // Process the remixed frame (e.g., encode, filter, etc.)
+                // ...
+            }
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                continue;
+            else if (ret < 0)
+                break;
+        }
+        av_packet_unref(ist->pkt);
+    }
+
+    av_frame_free(&frame);
+    return ret;
+}
+
